@@ -16,11 +16,18 @@ from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTu
 load_dotenv()
 
 
-def get_api_key() -> str:
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+def get_api_key_for_embedding() -> str:
+    api_key = os.getenv("GEMINI_API_KEY_FOR_EMBEDDING")
     if not api_key:
-        raise ValueError("Set GOOGLE_API_KEY or GEMINI_API_KEY in your .env file.")
-    os.environ["GOOGLE_API_KEY"] = api_key
+        raise ValueError("Set GEMINI_API_KEY in your .env file.")
+    os.environ["GEMINI_API_KEY_FOR_EMBEDDING"] = api_key
+    return api_key
+
+def get_api_key_for_chatbot() -> str:
+    api_key = os.getenv("GEMINI_API_KEY_FOR_CHATBOT")
+    if not api_key:
+        raise ValueError("Set GEMINI_API_KEY_FOR_CHATBOT in your .env file.")
+    os.environ["GEMINI_API_KEY_FOR_CHATBOT"] = api_key
     return api_key
 
 
@@ -58,7 +65,7 @@ def fetch_transcript(video_id: str) -> str:
 
 
 def build_vector_store(transcript: str, api_key: Optional[str] = None) -> InMemoryVectorStore:
-    api_key = api_key or get_api_key()
+    api_key = get_api_key_for_embedding()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_text(transcript)
 
@@ -73,14 +80,14 @@ def build_vector_store(transcript: str, api_key: Optional[str] = None) -> InMemo
     return vector_store
 
 
-def create_chain(video_id: str, api_key: Optional[str] = None):
+def create_chain(video_id: str, history_text: str = "", api_key: Optional[str] = None):
     transcript = fetch_transcript(video_id)
     vector_store = build_vector_store(transcript, api_key=api_key)
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.5-flash",
-        google_api_key=api_key or get_api_key(),
+        google_api_key=get_api_key_for_chatbot(),
         temperature=1.0,
         max_tokens=None,
         timeout=None,
@@ -89,13 +96,20 @@ def create_chain(video_id: str, api_key: Optional[str] = None):
 
     prompt = PromptTemplate(
         template="""
-        You are a helpful assistant who answers the query from the given context.
-        If you cannot find the answer, say you do not know.
+        You are a helpful assistant who answers the current question using the provided context and conversation history.
+        Use the history to maintain continuity and avoid repeating information.
+        If you cannot find the answer in the context, say you do not know.
 
-        Context: {context}
-        Query: {query}
+        Conversation history:
+        {history}
+
+        Context:
+        {context}
+
+        Current question:
+        {query}
         """,
-        input_variables=["context", "query"],
+        input_variables=["context", "history", "query"],
     )
 
     def format_docs(docs):
@@ -105,14 +119,18 @@ def create_chain(video_id: str, api_key: Optional[str] = None):
         {
             "context": retriever | RunnableLambda(format_docs),
             "query": RunnablePassthrough(),
+            "history": RunnableLambda(lambda _: history_text),
         }
     )
 
     return parallel_chain | prompt | llm | StrOutputParser()
 
 
-def answer_query(video_id: str, query: str, api_key: Optional[str] = None) -> str:
-    chain = create_chain(video_id, api_key=api_key)
+def answer_query(video_id: str, query: str, history: Optional[list[dict]] = None, api_key: Optional[str] = None) -> str:
+    history_text = "\n".join(
+        f"User: {item['user']}\nAssistant: {item['assistant']}" for item in (history or [])
+    )
+    chain = create_chain(video_id, history_text=history_text, api_key=api_key)
     return chain.invoke(query)
 
 
